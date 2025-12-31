@@ -1,0 +1,464 @@
+import os
+import pandas as pd
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import matplotlib.pyplot as plt
+from tqdm.auto import tqdm
+import warnings
+import random
+import copy
+
+warnings.filterwarnings('ignore')
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+# =========================================================
+# ⚙️ 설정: 100번 반복 실험
+# =========================================================
+NUM_RUNS = 100  # 100번 반복
+
+class Config:
+    STOCKS = ['META', 'TSLA', 'NFLX', 'NVDA', 'PLTR', 'MSFT', 'GOOG', 'AAPL', 'AVGO', 'AMZN']
+    START_DATE = '2020-11-02'
+    TRAIN_END = '2023-12-31'
+    TEST_START = '2024-01-01'
+    END_DATE = '2025-10-31'
+    INITIAL_CAPITAL = 10000.0
+
+# =========================================================
+# 🛠️ 유틸리티: 시드 고정 & 데이터 로드
+# =========================================================
+def set_all_seeds(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+def load_local_files():
+    print("📂 [Smart Loader] /content 폴더에서 파일 탐색 중...")
+    
+    search_dir = '/content'
+    if not os.path.exists(search_dir): 
+        search_dir = '.' 
+        
+    all_files = [f for f in os.listdir(search_dir) if f.endswith('.csv')]
+    
+    close_dict = {}
+    volume_dict = {}
+    loaded_count = 0
+    
+    for s in Config.STOCKS:
+        target_file = None
+        for fname in all_files:
+            if s.upper() in fname.upper():
+                target_file = os.path.join(search_dir, fname)
+                break
+        
+        if not target_file:
+            print(f"  ⚠️ [{s}] 파일을 찾을 수 없습니다. (목록에 없음)")
+            continue
+
+        try:
+            df = pd.read_csv(target_file)
+            df.columns = df.columns.str.strip()
+            
+            if 'Date' in df.columns: df['Date'] = pd.to_datetime(df['Date'])
+            else: df.rename(columns={df.columns[0]: 'Date'}, inplace=True); df['Date'] = pd.to_datetime(df['Date'])
+                
+            col_close = next((c for c in df.columns if 'close' in c.lower() or 'last' in c.lower()), None)
+            if col_close:
+                val_close = df[col_close].astype(str).str.replace(r'[$,]', '', regex=True).astype(float) if df[col_close].dtype == object else df[col_close]
+            else: continue
+
+            col_vol = next((c for c in df.columns if 'vol' in c.lower()), None)
+            if col_vol:
+                val_vol = df[col_vol].astype(str).str.replace(r'[$,]', '', regex=True).astype(float) if df[col_vol].dtype == object else df[col_vol]
+            else:
+                val_vol = pd.Series(0, index=df.index)
+
+            df = df.set_index('Date').sort_index()
+            df = df[~df.index.duplicated(keep='last')]
+            mask = (df.index >= Config.START_DATE) & (df.index <= Config.END_DATE)
+            
+            close_dict[s] = val_close.loc[mask]
+            volume_dict[s] = val_vol.loc[mask]
+            loaded_count += 1
+            
+        except Exception as e:
+            print(f"  ❌ {s} 로드 실패: {e}")
+
+    if not close_dict: 
+        print("❌ 로드된 데이터가 없습니다.")
+        return None, None
+    
+    print(f"✅ 총 {loaded_count}개 종목 로드 완료!")
+    close_df = pd.DataFrame(close_dict).fillna(method='ffill').fillna(method='bfill')
+    volume_df = pd.DataFrame(volume_dict).fillna(0)
+    
+    return close_df, volume_df
+
+# =========================================================
+# 🧠 모델 코어 정의
+# =========================================================
+class iTransformerCore(nn.Module):
+    def __init__(self, num_vars, seq_len=60, d_model=64):
+        super().__init__()
+        self.enc_embedding = nn.Linear(seq_len, d_model)
+        self.encoder = nn.TransformerEncoder(
+            nn.TransformerEncoderLayer(d_model, nhead=4, batch_first=True, dropout=0.1), num_layers=2
+        )
+        self.proj = nn.Linear(d_model, 1)
+
+    def forward(self, x):
+        x = x.permute(0, 2, 1)
+        x = self.enc_embedding(x)
+        x = self.encoder(x)
+        return self.proj(x).squeeze(-1)
+
+class PatchTSTCore(nn.Module):
+    def __init__(self, seq_len=60):
+        super().__init__()
+        self.linear = nn.Linear(seq_len, 1)
+    def forward(self, x):
+        x = x.permute(0, 2, 1)
+        return self.linear(x).squeeze(-1)
+
+class QuantformerCore(nn.Module):
+    def __init__(self, input_dim=2, d_model=32, nhead=4, num_layers=2):
+        super().__init__()
+        self.embedding = nn.Linear(input_dim, d_model)
+        self.encoder = nn.TransformerEncoder(
+            nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, batch_first=True, dropout=0.1),
+            num_layers=num_layers
+        )
+        self.fc_out = nn.Linear(d_model, 3) 
+        self.softmax = nn.Softmax(dim=-1)
+
+    def forward(self, x):
+        x = self.embedding(x)
+        x = self.encoder(x)
+        return self.softmax(self.fc_out(x[:, -1, :]))
+
+# =========================================================
+# 🤖 5개 에이전트 (버그 수정 완료)
+# =========================================================
+
+# [Team 1] JJH - [수정됨: 입력 스케일 불일치 해결]
+class Agent_JJH:
+    def __init__(self, num_stocks):
+        self.model = iTransformerCore(num_stocks).to(device)
+        self.optimizer = optim.Adam(self.model.parameters(), lr=0.001)
+    
+    def train(self, close_df, vol_df):
+        data = close_df.pct_change().fillna(0).values
+        X, y = [], []
+        for i in range(len(data) - 60):
+            X.append(data[i:i+60])
+            y.append(data[i+60])
+        X_t = torch.FloatTensor(np.array(X)).to(device)
+        y_t = torch.FloatTensor(np.array(y)).to(device)
+        
+        self.model.train()
+        for _ in range(5):
+            self.optimizer.zero_grad()
+            loss = nn.MSELoss()(self.model(X_t), y_t)
+            loss.backward()
+            self.optimizer.step()
+            
+    def trade(self, close_win, vol_win):
+        self.model.eval()
+        # [FIX] 주가(Raw Price)가 아닌 수익률(Return)을 입력으로 사용해야 함!
+        inp_data = close_win.pct_change().fillna(0).values
+        inp = torch.FloatTensor(inp_data).unsqueeze(0).to(device)
+        
+        with torch.no_grad(): scores = self.model(inp).cpu().numpy()[0]
+        w = np.zeros(len(scores))
+        w[np.argsort(scores)[-3:]] = 1/3
+        return w
+
+# [Team 2] JHP (Quantformer Edition)
+class Agent_JHP:
+    def __init__(self, num_stocks):
+        self.model = QuantformerCore(input_dim=2).to(device)
+        self.optimizer = optim.Adam(self.model.parameters(), lr=0.001)
+        self.lookback = 20
+        self.stocks = Config.STOCKS
+        
+    def _prepare_data(self, close_df, vol_df):
+        X_list, y_list = [], []
+        ret_df = close_df.pct_change().fillna(0)
+        turn_df = vol_df.pct_change().fillna(0)
+        
+        for stock in self.stocks:
+            rets = ret_df[stock].values
+            turns = turn_df[stock].values
+            
+            for i in range(len(rets) - self.lookback):
+                seq_ret = rets[i : i+self.lookback]
+                seq_turn = turns[i : i+self.lookback]
+                
+                seq = np.stack([seq_ret, seq_turn], axis=1) 
+                mean = seq.mean(axis=0)
+                std = seq.std(axis=0) + 1e-8
+                seq_norm = (seq - mean) / std
+                
+                next_r = rets[i+self.lookback]
+                if next_r > 0.005: label = 0 
+                elif next_r < -0.005: label = 2 
+                else: label = 1 
+                
+                X_list.append(seq_norm)
+                y_list.append(label)
+                
+        return torch.FloatTensor(np.array(X_list)).to(device), torch.LongTensor(np.array(y_list)).to(device)
+
+    def train(self, close_df, vol_df):
+        X, y = self._prepare_data(close_df, vol_df)
+        self.model.train()
+        criterion = nn.CrossEntropyLoss()
+        
+        if len(X) > 5000:
+            idx = torch.randperm(len(X))[:5000]
+            X_sub, y_sub = X[idx], y[idx]
+        else:
+            X_sub, y_sub = X, y
+            
+        for _ in range(5):
+            self.optimizer.zero_grad()
+            pred = self.model(X_sub)
+            loss = criterion(pred, y_sub)
+            loss.backward()
+            self.optimizer.step()
+
+    def trade(self, close_win, vol_win):
+        self.model.eval()
+        
+        ret_win = close_win.pct_change().fillna(0).iloc[-20:]
+        vol_win_pct = vol_win.pct_change().fillna(0).iloc[-20:]
+        
+        probs = []
+        for i in range(len(self.stocks)):
+            seq = np.stack([ret_win.iloc[:, i].values, vol_win_pct.iloc[:, i].values], axis=1)
+            mean = seq.mean(axis=0)
+            std = seq.std(axis=0) + 1e-8
+            seq_norm = (seq - mean) / std
+            
+            inp = torch.FloatTensor(seq_norm).unsqueeze(0).to(device)
+            with torch.no_grad():
+                out = self.model(inp)
+                bull_prob = out[0][0].item()
+                probs.append(bull_prob)
+        
+        w = np.zeros(len(self.stocks))
+        w[np.argsort(probs)[-3:]] = 1/3
+        return w
+
+# [Team 3] IHK
+class Agent_IHK:
+    def __init__(self, n): pass
+    def train(self, c, v): pass
+    def trade(self, close_win, vol_win):
+        vol = close_win.pct_change().std().values + 1e-6
+        inv_vol = 1.0 / vol
+        return inv_vol / np.sum(inv_vol)
+
+# [Team 4] HJK
+class Agent_HJK:
+    def __init__(self, n):
+        self.model = PatchTSTCore().to(device)
+        self.opt = optim.Adam(self.model.parameters(), lr=0.001)
+    def train(self, close_df, vol_df):
+        data = close_df.pct_change().fillna(0).values
+        X, y = [], []
+        for i in range(len(data) - 60):
+            X.append(data[i:i+60])
+            y.append(data[i+60])
+        X_t = torch.FloatTensor(np.array(X)).to(device)
+        y_t = torch.FloatTensor(np.array(y)).to(device)
+        
+        self.model.train()
+        for _ in range(5):
+            self.opt.zero_grad()
+            loss = nn.MSELoss()(self.model(X_t), y_t)
+            loss.backward()
+            self.opt.step()
+    def trade(self, c_win, v_win):
+        self.model.eval()
+        inp = c_win.pct_change().fillna(0).values
+        inp = torch.FloatTensor(inp).unsqueeze(0).to(device)
+        with torch.no_grad(): s = self.model(inp).cpu().numpy()[0]
+        w = np.zeros(len(s))
+        w[np.argsort(s)[-3:]] = 1/3
+        return w
+
+# [Team 5] YRK
+class Agent_YRK:
+    def __init__(self, n):
+        self.m = iTransformerCore(n).to(device)
+        self.h = nn.Linear(n, n).to(device)
+        self.opt = optim.Adam(list(self.m.parameters())+list(self.h.parameters()), lr=0.001)
+    def train(self, close_df, vol_df):
+        data = close_df.pct_change().fillna(0).values
+        X, y = [], []
+        for i in range(len(data) - 60):
+            X.append(data[i:i+60])
+            y.append(data[i+60])
+        X_t = torch.FloatTensor(np.array(X)).to(device)
+        y_t = torch.FloatTensor(np.array(y)).to(device)
+        
+        self.m.train()
+        for _ in range(5):
+            self.opt.zero_grad()
+            loss = nn.MSELoss()(self.h(self.m(X_t)), y_t)
+            loss.backward()
+            self.opt.step()
+    def trade(self, c_win, v_win):
+        self.m.eval()
+        inp = c_win.pct_change().fillna(0).values
+        inp = torch.FloatTensor(inp).unsqueeze(0).to(device)
+        with torch.no_grad(): 
+            s = self.m(inp)
+            scores = (s + self.h(s)).cpu().numpy()[0]
+        w = np.zeros(len(scores))
+        w[np.argsort(scores)[-3:]] = 1/3
+        return w
+
+# =========================================================
+# 🚀 몬테카를로 벤치마크 실행
+# =========================================================
+def run_monte_carlo_benchmark():
+    print(f"🚀 [Win QQQ] Monte Carlo Benchmark ({NUM_RUNS} Runs)")
+    print("   Fixed: Agent_JJH Scaling Issue")
+    print("⏳ Loading Data...")
+    
+    close_df, vol_df = load_local_files()
+    if close_df is None: 
+        print("❌ CSV 파일을 찾을 수 없습니다.")
+        return
+    
+    # QQQ 데이터
+    qqq_path = '/content/QQQ.csv'
+    try:
+        if os.path.exists(qqq_path):
+            qqq_df = pd.read_csv(qqq_path)
+            if 'Date' in qqq_df.columns: qqq_df['Date'] = pd.to_datetime(qqq_df['Date'])
+            else: qqq_df.rename(columns={qqq_df.columns[0]: 'Date'}, inplace=True); qqq_df['Date'] = pd.to_datetime(qqq_df['Date'])
+            col_close = next((c for c in qqq_df.columns if 'close' in c.lower()), None)
+            if col_close:
+                qqq_data = qqq_df.set_index('Date')[col_close].astype(str).str.replace(r'[$,]', '', regex=True).astype(float)
+            else:
+                qqq_data = pd.Series(0, index=close_df.index)
+        else:
+            qqq_data = pd.Series(0, index=close_df.index)
+    except:
+        qqq_data = pd.Series(0, index=close_df.index)
+
+    # 데이터 분할
+    train_close = close_df.loc[:Config.TRAIN_END]
+    train_vol = vol_df.loc[:Config.TRAIN_END]
+    
+    test_close = close_df.loc[Config.TEST_START:]
+    test_vol = vol_df.loc[Config.TEST_START:]
+    test_dates = test_close.index
+    
+    avg_portfolio = {
+        'JJH': np.zeros(len(test_dates)),
+        'JHP(Quant)': np.zeros(len(test_dates)),
+        'IHK': np.zeros(len(test_dates)),
+        'HJK': np.zeros(len(test_dates)),
+        'YRK': np.zeros(len(test_dates)),
+        'QQQ': np.zeros(len(test_dates))
+    }
+    final_stats = {k: [] for k in avg_portfolio.keys()} 
+    
+    qqq_base = qqq_data.loc[test_dates[0]] if not qqq_data.empty and test_dates[0] in qqq_data.index else 1.0
+    if not qqq_data.empty and test_dates[0] in qqq_data.index:
+        qqq_curve = (qqq_data.loc[test_dates].fillna(method='ffill') / qqq_base) * Config.INITIAL_CAPITAL
+    else:
+        qqq_curve = pd.Series(Config.INITIAL_CAPITAL, index=test_dates)
+
+    print(f"\n🏎️ Running {NUM_RUNS} Simulations...")
+    
+    for seed in tqdm(range(1, NUM_RUNS + 1)):
+        set_all_seeds(seed)
+        
+        # 1. 모델 초기화 & 학습
+        agents = {
+            'JJH': Agent_JJH(10),
+            'JHP(Quant)': Agent_JHP(10),
+            'IHK': Agent_IHK(10),
+            'HJK': Agent_HJK(10),
+            'YRK': Agent_YRK(10)
+        }
+        
+        for agent in agents.values():
+            agent.train(train_close, train_vol)
+            
+        # 2. 백테스트
+        run_res = {name: [Config.INITIAL_CAPITAL] for name in agents.keys()}
+        
+        for i in range(len(test_dates)-1):
+            curr_date = test_dates[i]
+            
+            c_win = close_df.loc[:curr_date].iloc[-60:]
+            v_win = vol_df.loc[:curr_date].iloc[-60:]
+            
+            curr_prices = close_df.loc[curr_date]
+            next_prices = close_df.loc[test_dates[i+1]]
+            day_ret = (next_prices - curr_prices) / curr_prices
+            
+            for name, agent in agents.items():
+                try:
+                    w = agent.trade(c_win, v_win)
+                    port_ret = np.sum(day_ret * w)
+                    new_val = run_res[name][-1] * (1 + port_ret)
+                    run_res[name].append(new_val)
+                except:
+                    run_res[name].append(run_res[name][-1])
+        
+        # 3. 누적
+        for name in agents.keys():
+            avg_portfolio[name] += np.array(run_res[name])
+            final_stats[name].append((run_res[name][-1] - Config.INITIAL_CAPITAL)/Config.INITIAL_CAPITAL*100)
+            
+        avg_portfolio['QQQ'] += qqq_curve.values
+        final_stats['QQQ'].append((qqq_curve.iloc[-1] - Config.INITIAL_CAPITAL)/Config.INITIAL_CAPITAL*100)
+
+    # 시각화
+    for name in avg_portfolio:
+        avg_portfolio[name] /= NUM_RUNS
+        
+    avg_df = pd.DataFrame(avg_portfolio, index=test_dates)
+    
+    plt.close('all')
+    plt.figure(figsize=(14, 7), dpi=120)
+    
+    colors = ['tab:blue', 'tab:orange', 'tab:green', 'tab:red', 'tab:purple', 'black']
+    for i, col in enumerate(avg_df.columns):
+        lw = 3 if col=='QQQ' else 2
+        ls = '--' if col=='QQQ' else '-'
+        plt.plot(avg_df.index, avg_df[col], label=col, linewidth=lw, linestyle=ls, color=colors[i%len(colors)], alpha=0.85)
+        
+    plt.title(f"Win QQQ Championship: Quantformer Edition ({NUM_RUNS} Runs) [Fixed]", fontsize=16)
+    plt.ylabel("Average Asset Value ($)")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.show()
+    
+    print("\n🏆 [Monte Carlo Analysis] 100회 실행 평균 성적 🏆")
+    print("-" * 75)
+    print(f"{'Model':<20} | {'Avg Return':<12} | {'Best Run':<10} | {'Worst Run':<10} | {'Std Dev':<10}")
+    print("-" * 75)
+    
+    for name in avg_portfolio.keys():
+        rets = np.array(final_stats[name])
+        print(f"{name:<20} | {np.mean(rets):6.1f}%      | {np.max(rets):6.1f}%    | {np.min(rets):6.1f}%     | {np.std(rets):5.1f}")
+    print("-" * 75)
+
+if __name__ == "__main__":
+    run_monte_carlo_benchmark()
